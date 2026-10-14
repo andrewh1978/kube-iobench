@@ -1,0 +1,2400 @@
+# kube-iobench: run fio-like IO workloads as StatefulSets and watch them live.
+#
+#   kubectl apply -f kube-iobench.yaml
+#   kubectl -n kube-iobench port-forward svc/iobench-ui 8080:80
+#   open http://localhost:8080
+#
+# Everything lives in the kube-iobench namespace. The only cluster-scoped objects are the
+# Namespace itself and a read-only ClusterRole so the UI can list StorageClasses.
+# The UI has no authentication of its own: do not expose it outside the cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kube-iobench
+  labels:
+    app.kubernetes.io/part-of: kube-iobench
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: iobench-ui
+  namespace: kube-iobench
+  labels:
+    app.kubernetes.io/part-of: kube-iobench
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: iobench-ui
+  namespace: kube-iobench
+  labels:
+    app.kubernetes.io/part-of: kube-iobench
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "delete", "deletecollection"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: iobench-ui
+  namespace: kube-iobench
+  labels:
+    app.kubernetes.io/part-of: kube-iobench
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: iobench-ui
+subjects:
+  - kind: ServiceAccount
+    name: iobench-ui
+    namespace: kube-iobench
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-iobench-storageclass-reader
+  labels:
+    app.kubernetes.io/part-of: kube-iobench
+rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-iobench-storageclass-reader
+  labels:
+    app.kubernetes.io/part-of: kube-iobench
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-iobench-storageclass-reader
+subjects:
+  - kind: ServiceAccount
+    name: iobench-ui
+    namespace: kube-iobench
+---
+# The IO generator. Mounted at /scripts in every worker pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iobench-script
+  namespace: kube-iobench
+  labels:
+    app.kubernetes.io/part-of: kube-iobench
+data:
+  pyfio.py: |
+    #!/usr/bin/env python3
+    """
+    pyfio - a tiny fio-like random IO generator with per-second stats.
+
+    Example:
+        python3 pyfio.py -f /tmp/test.bin -s 1 -b 4k -w 30 -i 5000 -t 50m
+        python3 pyfio.py -f /dev/shm/x -s 2 -b 64k            # 100% writes, unlimited
+        python3 pyfio.py -f /tmp/test.bin -s 1 -b 1m -w 50 -S # sequential, 50% writes
+        python3 pyfio.py -f /tmp/test.bin -s 1 -b 4k -j       # JSON output
+
+    Runs forever; press Ctrl+C to stop.
+    Linux/Unix only (uses os.preadv / os.pwritev).
+    """
+    import argparse
+    import json
+    import mmap
+    import os
+    import random
+    import signal
+    import struct
+    import sys
+    import threading
+    import time
+
+    GIB = 1024 ** 3
+    MIB = 1024 ** 2
+    FILL_CHUNK = MIB
+
+
+    def parse_size(text):
+        """Parse '4k', '1m', '512', '1.5g' (binary multiples) into bytes."""
+        t = text.strip().lower().rstrip("b")
+        if t.endswith("i"):          # allow 'kib', 'mib'
+            t = t[:-1]
+        mult = 1
+        if t and t[-1] in "kmgt":
+            mult = 1024 ** ("kmgt".index(t[-1]) + 1)
+            t = t[:-1]
+        try:
+            value = int(float(t) * mult)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid size: {text!r}")
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"size must be positive: {text!r}")
+        return value
+
+
+    class HelpOnErrorParser(argparse.ArgumentParser):
+        """Prints the error followed by the full help text, then exits."""
+
+        def error(self, message):
+            sys.stderr.write(f"error: {message}\n\n")
+            self.print_help(sys.stderr)
+            sys.exit(2)
+
+
+    def parse_args():
+        p = HelpOnErrorParser(prog="pyfio.py", add_help=False,
+                              description="fio-like IO load generator")
+        p.add_argument("-f", dest="path", required=True, help="path to file")
+        p.add_argument("-s", dest="size", type=float, required=True,
+                       help="size of file in GiB")
+        p.add_argument("-b", dest="bs", type=parse_size, required=True,
+                       help="block size, e.g. 4k, 64k, 1m")
+        p.add_argument("-w", dest="wpct", type=float, default=100.0,
+                       help="write percentage 0-100 (default 100)")
+        p.add_argument("-i", dest="iops", type=float, default=None,
+                       help="limit total IOPS (default: no limit)")
+        p.add_argument("-t", dest="tput", type=parse_size, default=None,
+                       help="limit total throughput per second, e.g. 100m "
+                            "(default: no limit)")
+        p.add_argument("-S", dest="seq", action="store_true",
+                       help="sequential IO (separate read and write cursors) "
+                            "instead of random")
+        p.add_argument("-j", dest="json", action="store_true",
+                       help="output stats as one line of JSON per second")
+        p.add_argument("-d", dest="direct", action="store_true",
+                       help="use O_DIRECT to bypass page cache (optional extra)")
+        a = p.parse_args()
+
+        if not 0 <= a.wpct <= 100:
+            p.error("-w must be between 0 and 100")
+        if a.size <= 0:
+            p.error("-s must be positive")
+        if a.iops is not None and a.iops <= 0:
+            p.error("-i must be positive")
+        a.size_bytes = int(a.size * GIB)
+        if a.bs > a.size_bytes:
+            p.error("block size larger than file size")
+        return a
+
+
+    class DataGen:
+        """Unique, incompressible data for every block (the idea behind fio's scramble_buffers).
+
+        A pool of random bytes is copied from a random offset for each block, and every
+        4 KiB unit of the block is then stamped with a counter, so no two units ever hold
+        the same bytes: deduplication and compression cannot short-cut the IO.
+        """
+
+        UNIT = 4096
+
+        def __init__(self, bs):
+            self.size = max(32 * MIB, 2 * bs)
+            self.pool = memoryview(bytearray(os.urandom(self.size)))
+            self.run_id = int.from_bytes(os.urandom(8), "little")
+            self.counter = 0
+            self.rnd = random.Random()
+
+        def fill(self, buf):
+            n = len(buf)
+            off = self.rnd.randrange(self.size - n + 1)
+            buf[:] = self.pool[off:off + n]
+            c = self.counter
+            for pos in range(0, n - 15, self.UNIT):
+                c += 1
+                struct.pack_into("<QQ", buf, pos, self.run_id, c)
+            self.counter = c
+
+
+    def prepare_file(path, size_bytes):
+        """Create / extend the file with real (non-sparse), unique random data."""
+        try:
+            current = os.path.getsize(path)
+        except FileNotFoundError:
+            current = 0
+        if current >= size_bytes:
+            return
+        print(f"Preparing {path}: writing {(size_bytes - current) / GIB:.2f} GiB ...",
+              file=sys.stderr)
+        gen = DataGen(FILL_CHUNK)
+        chunk = memoryview(bytearray(FILL_CHUNK))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT)
+        try:
+            pos = current
+            while pos < size_bytes:
+                n = min(FILL_CHUNK, size_bytes - pos)
+                gen.fill(chunk[:n])
+                os.pwrite(fd, chunk[:n], pos)
+                pos += n
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
+    class Stats:
+        # Only the worker thread writes; the reporter thread reads. Plain ints are
+        # fine under the GIL for this purpose.
+        def __init__(self):
+            self.r_ops = 0
+            self.r_bytes = 0
+            self.w_ops = 0
+            self.w_bytes = 0
+
+
+    def worker(args, stats, stop):
+        flags = os.O_RDWR
+        if args.direct:
+            flags |= os.O_DIRECT
+        fd = os.open(args.path, flags)
+
+        bs = args.bs
+        nblocks = args.size_bytes // bs
+        write_prob = args.wpct / 100.0
+
+        # page-aligned buffers (required for O_DIRECT, harmless otherwise)
+        wbuf = mmap.mmap(-1, bs)
+        wmv = memoryview(wbuf)
+        rbuf = mmap.mmap(-1, bs)
+        gen = DataGen(bs)
+
+        # Pacing: every IO "costs" a number of seconds; we schedule IOs on a
+        # single timeline so both limits are honoured (the stricter one wins).
+        cost = 0.0
+        if args.iops:
+            cost = max(cost, 1.0 / args.iops)
+        if args.tput:
+            cost = max(cost, bs / args.tput)
+        next_ts = time.perf_counter()
+
+        rnd = random.Random()
+        seq = args.seq
+        r_cursor = 0
+        w_cursor = 0
+        try:
+            while not stop.is_set():
+                if cost:
+                    now = time.perf_counter()
+                    if next_ts > now:
+                        # wait, but wake up promptly on stop
+                        if stop.wait(next_ts - now):
+                            break
+                    elif now - next_ts > 1.0:
+                        next_ts = now          # don't burst after long stalls
+                    next_ts += cost
+
+                is_write = rnd.random() < write_prob
+                if seq:
+                    # separate cursors for reads and writes, wrapping at EOF
+                    if is_write:
+                        off = w_cursor * bs
+                        w_cursor = (w_cursor + 1) % nblocks
+                    else:
+                        off = r_cursor * bs
+                        r_cursor = (r_cursor + 1) % nblocks
+                else:
+                    off = rnd.randrange(nblocks) * bs
+
+                if is_write:
+                    gen.fill(wmv)                  # new, unique data for every write
+                    os.pwritev(fd, [wmv], off)
+                    stats.w_ops += 1
+                    stats.w_bytes += bs
+                else:
+                    os.preadv(fd, [rbuf], off)
+                    stats.r_ops += 1
+                    stats.r_bytes += bs
+        finally:
+            os.close(fd)
+
+
+    def fmt_tp(bytes_per_s):
+        return f"{bytes_per_s / MIB:9.2f} MiB/s"
+
+
+    def main():
+        args = parse_args()
+        prepare_file(args.path, args.size_bytes)
+
+        stats = Stats()
+        stop = threading.Event()
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+        t = threading.Thread(target=worker, args=(args, stats, stop), daemon=True)
+        t.start()
+
+        print(f"file={args.path} size={args.size_bytes / GIB:g}GiB bs={args.bs} "
+              f"pattern={'sequential' if args.seq else 'random'} "
+              f"write%={args.wpct:g} iops_limit={args.iops or 'none'} "
+              f"tput_limit={(str(args.tput) + 'B/s') if args.tput else 'none'}",
+              file=sys.stderr)
+
+        prev = (0, 0, 0, 0)
+        prev_t = time.perf_counter()
+        while True:
+            # Wake on whole wall-clock seconds so the windows of all pods line up.
+            if stop.wait(1.0 - (time.time() % 1.0)):
+                break
+            now = time.perf_counter()
+            wall = time.time()
+            dt = now - prev_t
+            if dt < 0.25:            # woke a hair early: fold this window into the next one
+                continue
+            cur = (stats.r_ops, stats.r_bytes, stats.w_ops, stats.w_bytes)
+            d = [(c - p) / dt for c, p in zip(cur, prev)]
+            if args.json:
+                # The sample covers the dt seconds that end at ts.
+                print(json.dumps({
+                    "ts": round(wall, 3),
+                    "dt": round(dt, 3),
+                    "read_iops": round(d[0], 2),
+                    "read_bytes_per_sec": round(d[1], 2),
+                    "write_iops": round(d[2], 2),
+                    "write_bytes_per_sec": round(d[3], 2),
+                }), flush=True)
+            else:
+                print(f"read: {fmt_tp(d[1])} {d[0]:10.0f} IOPS | "
+                      f"write: {fmt_tp(d[3])} {d[2]:10.0f} IOPS", flush=True)
+            prev, prev_t = cur, now
+
+        t.join(timeout=2)
+        print("stopped", file=sys.stderr)
+
+
+    if __name__ == "__main__":
+        main()
+---
+# Backend and web UI. Mounted at /app in the UI pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: iobench-app
+  namespace: kube-iobench
+  labels:
+    app.kubernetes.io/part-of: kube-iobench
+data:
+  server.py: |
+    #!/usr/bin/env python3
+    """
+    kube-iobench backend.
+
+     * serves the web UI (index.html)
+     * creates / scales / deletes StatefulSets that run pyfio.py
+     * follows the JSON stats printed by every worker pod (pod logs), aggregates
+       them once per second per workload and for the whole cluster, and streams
+       the result to browsers over Server-Sent Events
+
+    Uses only the Python standard library, so it runs on a stock python image.
+    """
+    import http.client
+    import json
+    import math
+    import os
+    import re
+    import signal
+    import ssl
+    import sys
+    import threading
+    import time
+    from collections import deque
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import quote, urlparse
+
+    SA_DIR = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+
+    def _read(path, default=""):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            return default
+
+
+    NAMESPACE = os.environ.get("IOBENCH_NAMESPACE") or _read(SA_DIR + "/namespace", "kube-iobench")
+    IMAGE = os.environ.get("IOBENCH_IMAGE", "python:3.12-slim")
+    SCRIPT_CONFIGMAP = os.environ.get("IOBENCH_SCRIPT_CONFIGMAP", "iobench-script")
+    APP_DIR = os.environ.get("IOBENCH_APP_DIR", "/app")
+    PORT = int(os.environ.get("PORT", "8080"))
+    KUBE_API = os.environ.get("KUBE_API")  # override for local testing, e.g. http://127.0.0.1:9001
+    TOKEN_FILE = os.environ.get("KUBE_TOKEN_FILE", SA_DIR + "/token")
+    CA_FILE = os.environ.get("KUBE_CA_FILE", SA_DIR + "/ca.crt")
+
+    HISTORY_SECONDS = 900        # history kept for charts
+    REFRESH_EVERY = 2.0          # how often workloads / pods are re-listed
+    TICK = 0.5                   # how often the publisher looks for finished seconds
+    STALE_AFTER = 3.5            # a pod is shown as "stalled" after this long without a sample
+    STALL_AFTER = 4.0            # ... and then stops holding back the totals
+    IDLE_LAG = 2.0               # with nothing running, the timeline trails the clock by this much
+    MAX_LAG = 6.0                # never wait longer than this for a slow pod
+    ASSUMED_LATENCY = 0.15       # typical delay between a sample being taken and arriving here
+    TRUST_SKEW = 1.5             # node clock differences up to this are trusted, larger ones corrected
+    KEEP_GONE = 12.0             # keep samples of a deleted pod this long so its last seconds count
+
+    LABEL_APP = "app.kubernetes.io/name"
+    APP_VALUE = "iobench-worker"
+    LABEL_WL = "kube-iobench/workload"
+    ANN_CONFIG = "kube-iobench/config"
+    SELECTOR = f"{LABEL_APP}={APP_VALUE}"
+
+    NAME_RE = re.compile(r"^[a-z]([-a-z0-9]{0,38}[a-z0-9])?$")
+    SC_RE = re.compile(r"^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$")
+    MAX_REPLICAS = 200
+    MiB = 1024 ** 2
+    GiB = 1024 ** 3
+
+
+    def log(*a):
+        print(*a, file=sys.stderr, flush=True)
+
+
+    # --------------------------------------------------------------------------
+    # Kubernetes API client (no third-party dependencies)
+    # --------------------------------------------------------------------------
+    class KubeError(Exception):
+        def __init__(self, status, message):
+            super().__init__(message)
+            self.status = status
+            self.message = message
+
+
+    _ssl_ctx = None
+
+
+    def _conn(timeout):
+        global _ssl_ctx
+        if KUBE_API:
+            u = urlparse(KUBE_API)
+            if u.scheme == "https":
+                return http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=timeout)
+            return http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+        if _ssl_ctx is None:
+            _ssl_ctx = ssl.create_default_context(cafile=CA_FILE)
+        host = os.environ.get("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+        port = int(os.environ.get("KUBERNETES_SERVICE_PORT", "443"))
+        return http.client.HTTPSConnection(host, port, timeout=timeout, context=_ssl_ctx)
+
+
+    def _headers(content_type=None):
+        h = {"Accept": "application/json"}
+        token = _read(TOKEN_FILE)  # re-read: projected tokens rotate
+        if token:
+            h["Authorization"] = "Bearer " + token
+        if content_type:
+            h["Content-Type"] = content_type
+        return h
+
+
+    def kube(method, path, body=None, content_type="application/json", timeout=20):
+        conn = _conn(timeout)
+        try:
+            data = json.dumps(body).encode() if body is not None else None
+            conn.request(method, path, body=data,
+                         headers=_headers(content_type if body is not None else None))
+            resp = conn.getresponse()
+            raw = resp.read()
+        finally:
+            conn.close()
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except ValueError:
+            parsed = {"message": raw[:200].decode(errors="replace")}
+        if resp.status >= 400:
+            raise KubeError(resp.status, parsed.get("message") or resp.reason)
+        return parsed
+
+
+    def sel(s):
+        return "labelSelector=" + quote(s, safe="")
+
+
+    STS_PATH = f"/apis/apps/v1/namespaces/{NAMESPACE}/statefulsets"
+    POD_PATH = f"/api/v1/namespaces/{NAMESPACE}/pods"
+    PVC_PATH = f"/api/v1/namespaces/{NAMESPACE}/persistentvolumeclaims"
+
+
+    # --------------------------------------------------------------------------
+    # Shared state
+    # --------------------------------------------------------------------------
+    lock = threading.Lock()
+    cond = threading.Condition(lock)
+
+    workloads = {}      # name -> {name, config, replicas, ready, created, uid}
+    pod_info = {}       # pod name -> {workload, phase, node, uid, owner}
+    pod_series = {}     # pod uid -> PodSeries (raw samples of one pod incarnation)
+    followers = {}      # pod uid -> (thread, stop_event)
+    history = deque(maxlen=HISTORY_SECONDS)
+    api_error = ""
+    seq = 0
+    last_event_json = "{}"
+    next_bucket = None  # end of the next whole second that has not been published yet
+
+
+    # --------------------------------------------------------------------------
+    # Input validation / StatefulSet construction
+    # --------------------------------------------------------------------------
+    def parse_size(text):
+        """'4k', '1m', '512', '1.5g' -> bytes (same rules as pyfio.py)."""
+        t = str(text).strip().lower().rstrip("b")
+        if t.endswith("i"):
+            t = t[:-1]
+        mult = 1
+        if t and t[-1] in "kmgt":
+            mult = 1024 ** ("kmgt".index(t[-1]) + 1)
+            t = t[:-1]
+        try:
+            value = int(float(t) * mult)
+        except ValueError:
+            raise ValueError(f"invalid size: {text!r}")
+        if value <= 0:
+            raise ValueError(f"size must be positive: {text!r}")
+        return value
+
+
+    def _num(p, key, default=None, lo=None, hi=None, integer=False):
+        v = p.get(key, default)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return None
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a number")
+        if math.isnan(v) or math.isinf(v):
+            raise ValueError(f"{key} must be a number")
+        if integer:
+            if v != int(v):
+                raise ValueError(f"{key} must be a whole number")
+            v = int(v)
+        if lo is not None and v < lo:
+            raise ValueError(f"{key} must be at least {lo}")
+        if hi is not None and v > hi:
+            raise ValueError(f"{key} must be at most {hi}")
+        return v
+
+
+    def validate(p):
+        """Validate the create request, return a normalised config dict."""
+        name = str(p.get("name", "")).strip()
+        if not NAME_RE.match(name):
+            raise ValueError("name must be 1-40 characters: lowercase letters, digits and '-', "
+                             "starting with a letter and ending with a letter or digit")
+        replicas = _num(p, "replicas", 1, 1, MAX_REPLICAS, integer=True)
+        if replicas is None:
+            raise ValueError("replicas is required")
+        size = _num(p, "size_gib", None, 0.001, 100000)
+        if size is None:
+            raise ValueError("size_gib is required")
+        bs_text = str(p.get("block_size", "4k")).strip().lower() or "4k"
+        bs = parse_size(bs_text)
+        if bs < 512 or bs > 64 * MiB:
+            raise ValueError("block size must be between 512 bytes and 64m")
+        if bs > int(size * GiB):
+            raise ValueError("block size is larger than the file")
+        write_pct = _num(p, "write_pct", 100, 0, 100)
+        if write_pct is None:
+            write_pct = 100.0
+        iops = _num(p, "iops", None, 0.001)
+        tput_text = str(p.get("throughput") or "").strip().lower()
+        tput = parse_size(tput_text) if tput_text else None
+        sequential = bool(p.get("sequential", False))
+        direct = bool(p.get("direct", False))
+        if direct and bs % 512:
+            raise ValueError("direct IO needs a block size that is a multiple of 512 bytes")
+        sc = str(p.get("storage_class") or "").strip()
+        if sc and not SC_RE.match(sc):
+            raise ValueError("invalid storage class name")
+        pvc = _num(p, "pvc_gib", None, 0.001, 1000000)
+        if pvc is None:
+            pvc = auto_pvc_gib(size)
+        else:
+            need = round(size * 1.03 + 1e-9, 3)     # the file plus room for filesystem metadata
+            if pvc < need:
+                raise ValueError(f"volume size must be at least {need:g} GiB: "
+                                 f"the file ({size:g} GiB) plus filesystem overhead")
+        return {
+            "name": name, "replicas": replicas, "size_gib": size,
+            "block_size": bs_text, "block_bytes": bs, "write_pct": write_pct,
+            "iops": iops, "throughput": tput_text or None, "throughput_bytes": tput,
+            "sequential": sequential, "direct": direct, "storage_class": sc, "pvc_gib": pvc,
+        }
+
+
+    def auto_pvc_gib(size_gib):
+        """Volume size used when none is given: the file plus about 10% (at least 1 GiB more)."""
+        return max(math.ceil(size_gib * 1.1), math.ceil(size_gib) + 1)
+
+
+    def pvc_quantity(gib):
+        """GiB (possibly fractional) -> Kubernetes quantity."""
+        if float(gib).is_integer():
+            return f"{int(gib)}Gi"
+        return f"{math.ceil(gib * 1024)}Mi"
+
+
+    def build_statefulset(c):
+        name = c["name"]
+        labels = {LABEL_APP: APP_VALUE, LABEL_WL: name}
+        args = ["-f", "/data/iobench.bin", "-s", repr(float(c["size_gib"])),
+                "-b", str(c["block_bytes"]), "-w", f"{c['write_pct']:g}"]
+        if c["iops"]:
+            args += ["-i", f"{c['iops']:g}"]
+        if c["throughput_bytes"]:
+            args += ["-t", str(c["throughput_bytes"])]
+        if c["sequential"]:
+            args.append("-S")
+        if c["direct"]:
+            args.append("-d")
+        args.append("-j")
+
+        claim_spec = {
+            "accessModes": ["ReadWriteOnce"],
+            "resources": {"requests": {"storage": pvc_quantity(c["pvc_gib"])}},
+        }
+        if c["storage_class"]:
+            claim_spec["storageClassName"] = c["storage_class"]
+
+        stored = {k: v for k, v in c.items() if k not in ("block_bytes", "throughput_bytes")}
+        return {
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {
+                "name": name, "namespace": NAMESPACE, "labels": labels,
+                "annotations": {ANN_CONFIG: json.dumps(stored)},
+            },
+            "spec": {
+                "replicas": c["replicas"],
+                "serviceName": name,
+                "podManagementPolicy": "Parallel",
+                "selector": {"matchLabels": labels},
+                "persistentVolumeClaimRetentionPolicy": {"whenDeleted": "Delete", "whenScaled": "Delete"},
+                "template": {
+                    "metadata": {"labels": labels},
+                    "spec": {
+                        "terminationGracePeriodSeconds": 5,
+                        # Prefer different nodes. Spread the replicas of this workload evenly, and
+                        # (as a weaker wish) keep away from other benchmark pods. Both are soft,
+                        # so a pod can still be placed on a busy node and never stays Pending.
+                        "topologySpreadConstraints": [
+                            {"maxSkew": 1, "topologyKey": "kubernetes.io/hostname",
+                             "whenUnsatisfiable": "ScheduleAnyway",
+                             "labelSelector": {"matchLabels": {LABEL_WL: name}}},
+                        ],
+                        "affinity": {"podAntiAffinity": {
+                            "preferredDuringSchedulingIgnoredDuringExecution": [{
+                                "weight": 50,
+                                "podAffinityTerm": {
+                                    "topologyKey": "kubernetes.io/hostname",
+                                    "labelSelector": {"matchLabels": {LABEL_APP: APP_VALUE}},
+                                },
+                            }],
+                        }},
+                        "containers": [{
+                            "name": "pyfio",
+                            "image": IMAGE,
+                            "command": ["python3", "-u", "/scripts/pyfio.py"],
+                            "args": args,
+                            "volumeMounts": [
+                                {"name": "data", "mountPath": "/data"},
+                                {"name": "script", "mountPath": "/scripts", "readOnly": True},
+                            ],
+                        }],
+                        "volumes": [{"name": "script", "configMap": {"name": SCRIPT_CONFIGMAP}}],
+                    },
+                },
+                "volumeClaimTemplates": [{
+                    "metadata": {"name": "data", "labels": labels},
+                    "spec": claim_spec,
+                }],
+            },
+        }
+
+
+    # --------------------------------------------------------------------------
+    # Workload operations
+    # --------------------------------------------------------------------------
+    def get_workload_sts(name):
+        """Fetch one of our StatefulSets; refuse to touch anything we did not create."""
+        if not NAME_RE.match(name):
+            raise KubeError(404, "workload not found")
+        sts = kube("GET", f"{STS_PATH}/{name}")
+        if (sts.get("metadata", {}).get("labels") or {}).get(LABEL_APP) != APP_VALUE:
+            raise KubeError(404, "workload not found")
+        return sts
+
+
+    def create_workload(payload):
+        cfg = validate(payload)
+        kube("POST", STS_PATH, build_statefulset(cfg))
+        return {"name": cfg["name"]}
+
+
+    def scale_workload(name, replicas):
+        get_workload_sts(name)
+        kube("PATCH", f"{STS_PATH}/{name}", {"spec": {"replicas": replicas}},
+             content_type="application/merge-patch+json")
+        return {"name": name, "replicas": replicas}
+
+
+    def delete_workload(name):
+        get_workload_sts(name)
+        kube("DELETE", f"{STS_PATH}/{name}?propagationPolicy=Background")
+        # PVCs are removed by the retention policy on recent clusters; make sure on older ones.
+        try:
+            kube("DELETE", f"{PVC_PATH}?" + sel(f"{LABEL_WL}={name}"))
+        except KubeError as e:
+            log("pvc cleanup failed:", e.message)
+        return {"name": name}
+
+
+    def list_storage_classes():
+        items = kube("GET", "/apis/storage.k8s.io/v1/storageclasses").get("items", [])
+        out = []
+        for it in items:
+            ann = it.get("metadata", {}).get("annotations") or {}
+            default = (ann.get("storageclass.kubernetes.io/is-default-class") == "true"
+                       or ann.get("storageclass.beta.kubernetes.io/is-default-class") == "true")
+            out.append({"name": it["metadata"]["name"], "provisioner": it.get("provisioner", ""),
+                        "default": default})
+        return sorted(out, key=lambda x: x["name"])
+
+
+    # --------------------------------------------------------------------------
+    # History helpers
+    # --------------------------------------------------------------------------
+    def round_vals(v):
+        """(read iops, read B/s, write iops, write B/s) -> compact numbers."""
+        return [round(v[0], 1), int(round(v[1])), round(v[2], 1), int(round(v[3]))]
+
+
+    def sum_workloads(per_wl):
+        t = [0.0, 0.0, 0.0, 0.0, 0]
+        for a in per_wl.values():
+            for i in range(5):
+                t[i] += a[i]
+        return [round(t[0], 1), int(round(t[1])), round(t[2], 1), int(round(t[3])), t[4]]
+
+
+    def purge_workload(name):
+        """Wipe every metric of a deleted workload from the history (lock must be held).
+        The cluster total is recomputed from the workloads that remain."""
+        for e in history:
+            if name in e["w"]:
+                del e["w"][name]
+                e["p"].pop(name, None)
+                e["total"] = sum_workloads(e["w"])
+
+
+    # --------------------------------------------------------------------------
+    # Samples and alignment
+    #
+    # A pod reports "dt seconds ending at ts" about once per second. Totals are built
+    # by cutting those windows into whole wall-clock seconds and adding up what each
+    # pod did inside every second. Which pod reports when, jitter in log delivery,
+    # duplicated or missing lines: none of it changes which second a sample belongs to.
+    # A second is published only after every active pod has reported past it.
+    # --------------------------------------------------------------------------
+    class PodSeries:
+        """Raw samples of one pod incarnation (keyed by pod uid, so a pod that is deleted
+        and re-created under the same name can never mix its data with the old one)."""
+
+        def __init__(self, workload, owner):
+            self.workload = workload
+            self.owner = owner                # uid of the StatefulSet the pod belongs to
+            self.samples = deque(maxlen=60)   # (start, end, (ri, rb, wi, wb)) on the pod's clock
+            self.deltas = deque(maxlen=60)    # arrival time - sample time: reveals clock skew
+            self.last_ts = 0.0
+            self.last_recv = 0.0              # monotonic arrival of the newest sample
+            self._shift = 0.0
+            self.gone_at = None               # monotonic time the pod disappeared
+
+        def add(self, ts, dt, v, recv_wall):
+            if ts <= self.last_ts:
+                return False                  # already have it (log re-read after a reconnect)
+            self.samples.append((ts - dt, ts, v))
+            self.deltas.append(recv_wall - ts)
+            self.last_ts = ts
+            self.last_recv = time.monotonic()
+            self._shift = self._compute_shift()
+            return True
+
+        def shift(self):
+            return self._shift
+
+        def _compute_shift(self):
+            """Seconds to add to this pod's timestamps. Node clocks are trusted, but a clock
+            that is clearly off (arrival delay far from typical) is corrected."""
+            if len(self.deltas) < 3:
+                return 0.0
+            d = min(self.deltas) - ASSUMED_LATENCY
+            return 0.0 if abs(d) <= TRUST_SKEW else d
+
+        def newest_end(self):
+            return self.samples[-1][1] + self.shift() if self.samples else None
+
+        def bucket(self, b):
+            """What the pod did during the whole second [b-1, b): the four counters
+            (rate x overlapping time, summed over the windows) and the seconds covered."""
+            sh = self.shift()
+            lo, hi = b - 1.0, float(b)
+            acc = [0.0, 0.0, 0.0, 0.0]
+            cov = 0.0
+            for s, e, v in reversed(self.samples):
+                if e + sh <= lo:
+                    break                     # everything before this is older than the second
+                ov = min(e + sh, hi) - max(s + sh, lo)
+                if ov > 0:
+                    cov += ov
+                    for i in range(4):
+                        acc[i] += v[i] * ov
+            return acc, cov
+
+
+    def follow_pod(pod, uid, stop):
+        """Read the JSON lines a worker prints. After a drop, resume from the last
+        timestamp that was received instead of trusting whatever comes next."""
+        base = f"{POD_PATH}/{pod}/log?follow=true"
+        while not stop.is_set():
+            with lock:
+                ps = pod_series.get(uid)
+                last = ps.last_ts if ps else 0.0
+            if last:
+                since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(0.0, last - 2.0)))
+                path = base + "&sinceTime=" + since
+            else:
+                path = base + "&tailLines=1"
+            conn = None
+            try:
+                conn = _conn(60)
+                conn.request("GET", path, headers=_headers())
+                resp = conn.getresponse()
+                if resp.status != 200:
+                    resp.read()
+                    stop.wait(2)
+                    continue
+                while not stop.is_set():
+                    line = resp.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line.startswith(b"{"):
+                        continue          # banner / progress messages
+                    try:
+                        d = json.loads(line)
+                        ts = float(d["ts"])
+                        dt = float(d.get("dt", 1.0))
+                        v = (float(d["read_iops"]), float(d["read_bytes_per_sec"]),
+                             float(d["write_iops"]), float(d["write_bytes_per_sec"]))
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                    if not 0.0 < dt <= 30.0:
+                        continue
+                    recv = time.time()
+                    with lock:
+                        info = pod_info.get(pod)
+                        if info and info["uid"] == uid:
+                            ps = pod_series.get(uid)
+                            if ps is None:
+                                ps = pod_series[uid] = PodSeries(info["workload"], info["owner"])
+                            ps.add(ts, dt, v, recv)
+            except (OSError, http.client.HTTPException):
+                pass
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+            stop.wait(1)
+
+
+    def refresh_loop():
+        global api_error
+        while True:
+            try:
+                sts_items = kube("GET", f"{STS_PATH}?" + sel(SELECTOR)).get("items", [])
+                pod_items = kube("GET", f"{POD_PATH}?" + sel(SELECTOR)).get("items", [])
+
+                new_wl = {}
+                for s in sts_items:
+                    md = s.get("metadata", {})
+                    try:
+                        cfg = json.loads((md.get("annotations") or {}).get(ANN_CONFIG, "{}"))
+                    except ValueError:
+                        cfg = {}
+                    new_wl[md["name"]] = {
+                        "name": md["name"], "config": cfg,
+                        "replicas": s.get("spec", {}).get("replicas", 0),
+                        "ready": s.get("status", {}).get("readyReplicas", 0) or 0,
+                        "created": md.get("creationTimestamp", ""),
+                        "uid": md.get("uid", ""),
+                    }
+                new_pods = {}
+                for p in pod_items:
+                    md = p.get("metadata", {})
+                    wl = (md.get("labels") or {}).get(LABEL_WL)
+                    if not wl:
+                        continue
+                    phase = p.get("status", {}).get("phase", "Unknown")
+                    if md.get("deletionTimestamp"):
+                        phase = "Terminating"
+                    owner = next((o.get("uid", "") for o in md.get("ownerReferences") or []
+                                  if o.get("kind") == "StatefulSet"), "")
+                    new_pods[md["name"]] = {
+                        "workload": wl, "phase": phase, "uid": md.get("uid", ""), "owner": owner,
+                        "node": p.get("spec", {}).get("nodeName", "") or "",
+                    }
+
+                mono = time.monotonic()
+                live_uids = {i["uid"] for i in new_pods.values()}
+                with lock:
+                    gone = {n for n, old in workloads.items()
+                            if n not in new_wl or new_wl[n]["uid"] != old["uid"]}
+                    for n in gone:
+                        purge_workload(n)
+                    for uid in [u for u, ps in pod_series.items() if ps.workload in gone]:
+                        del pod_series[uid]
+                    workloads.clear()
+                    workloads.update(new_wl)
+                    pod_info.clear()
+                    pod_info.update(new_pods)
+                    for uid, ps in list(pod_series.items()):
+                        if uid in live_uids:
+                            ps.gone_at = None
+                        elif ps.gone_at is None:
+                            ps.gone_at = mono
+                        elif mono - ps.gone_at > KEEP_GONE:
+                            del pod_series[uid]
+                    api_error = ""
+
+                for name, info in new_pods.items():
+                    uid = info["uid"]
+                    entry = followers.get(uid)
+                    if info["phase"] == "Running" and not (entry and entry[0].is_alive()):
+                        stop = threading.Event()
+                        t = threading.Thread(target=follow_pod, args=(name, uid, stop), daemon=True)
+                        followers[uid] = (t, stop)
+                        t.start()
+                for uid in [u for u in followers if u not in live_uids]:
+                    followers.pop(uid)[1].set()
+            except KubeError as e:
+                with lock:
+                    api_error = f"Kubernetes API: {e.message}"
+                log("refresh failed:", e.message)
+            except (OSError, http.client.HTTPException) as e:
+                with lock:
+                    api_error = f"Cannot reach the Kubernetes API: {e}"
+                log("refresh failed:", repr(e))
+            except Exception as e:  # keep the loop alive no matter what
+                with lock:
+                    api_error = f"Backend error: {e}"
+                log("refresh failed:", repr(e))
+            time.sleep(REFRESH_EVERY)
+
+
+    # --------------------------------------------------------------------------
+    # Publishing whole seconds
+    # --------------------------------------------------------------------------
+    def make_entry(b):
+        """Totals for the whole second [b-1, b), per workload, per replica and overall."""
+        per_wl = {n: [0.0, 0.0, 0.0, 0.0, 0] for n in workloads}
+        per_pod = {n: {} for n in workloads}
+        names = {i["uid"]: n for n, i in pod_info.items()}
+        for uid, ps in pod_series.items():
+            wl = ps.workload
+            if wl not in per_wl or workloads[wl]["uid"] != ps.owner:
+                continue                      # deleted workload, or data of an older incarnation
+            acc, cov = ps.bucket(b)
+            if cov <= 0:
+                continue
+            per_pod[wl][names.get(uid, uid)] = round_vals(acc)
+            a = per_wl[wl]
+            for i in range(4):
+                a[i] += acc[i]
+            if cov >= 0.5:
+                a[4] += 1
+        w_out = {n: round_vals(a) + [a[4]] for n, a in per_wl.items()}
+        return {"t": b, "total": sum_workloads(w_out), "w": w_out, "p": per_pod}
+
+
+    def finalize(now):
+        """Build the entries for every whole second that is now complete (lock held)."""
+        global next_bucket
+        mono = time.monotonic()
+        ends = [ps.newest_end() for ps in pod_series.values()
+                if ps.gone_at is None and ps.samples and mono - ps.last_recv <= STALL_AFTER]
+        # complete = every active pod has reported past it; never wait longer than MAX_LAG
+        target = math.floor(min(ends)) if ends else math.floor(now - IDLE_LAG)
+        target = max(target, math.floor(now - MAX_LAG))
+        target = min(target, math.floor(now))
+        if next_bucket is None or next_bucket < math.floor(now) - HISTORY_SECONDS:
+            starts = [ps.samples[0][0] + ps.shift() for ps in pod_series.values() if ps.samples]
+            next_bucket = (math.ceil(min(starts)) + 1) if starts else math.floor(now - IDLE_LAG)
+        out = []
+        while next_bucket <= target and len(out) < 120:
+            out.append(make_entry(next_bucket))
+            next_bucket += 1
+        return out
+
+
+    def tick_loop():
+        global seq, last_event_json
+        next_t = time.monotonic()
+        last_emit = 0.0
+        while True:
+            next_t += TICK
+            time.sleep(max(0.0, next_t - time.monotonic()))
+            with lock:
+                entries = finalize(time.time())
+                history.extend(entries)
+                mono = time.monotonic()
+                if not entries and mono - last_emit < 1.0:
+                    continue
+                last_emit = mono
+                latest = history[-1] if history else None
+
+                pods_out = {n: [] for n in workloads}
+                for pod, info in sorted(pod_info.items()):
+                    wl = info["workload"]
+                    if wl not in pods_out:
+                        continue
+                    ps = pod_series.get(info["uid"])
+                    v = [0.0, 0, 0.0, 0]
+                    if info["phase"] != "Running":
+                        state = info["phase"].lower()
+                    elif ps is None or not ps.samples:
+                        state = "preparing"
+                    elif mono - ps.last_recv > STALE_AFTER:
+                        state = "stalled"
+                    else:
+                        state = "running"
+                        v = round_vals(ps.samples[-1][2])
+                    pods_out[wl].append({"name": pod, "phase": info["phase"], "state": state,
+                                         "node": info["node"], "v": v})
+                wl_list = sorted(workloads.values(), key=lambda w: (w["created"], w["name"]))
+                event = {
+                    "t": round(time.time(), 3), "entries": entries,
+                    "total": latest["total"] if latest else [0, 0, 0, 0, 0],
+                    "w": latest["w"] if latest else {}, "p": latest["p"] if latest else {},
+                    "workloads": wl_list, "pods": pods_out, "error": api_error,
+                }
+                last_event_json = json.dumps(event)
+                seq += 1
+                cond.notify_all()
+
+
+    # --------------------------------------------------------------------------
+    # HTTP server
+    # --------------------------------------------------------------------------
+    WORKLOAD_PATH = re.compile(r"^/api/workloads/([^/]+)$")
+
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "kube-iobench"
+
+        def log_message(self, fmt, *args):
+            pass  # keep pod logs quiet; errors are logged explicitly
+
+        def _send(self, code, body, ctype="application/json"):
+            if not isinstance(body, bytes):
+                body = json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _body(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 65536:
+                raise ValueError("request body too large")
+            if n == 0:
+                return {}
+            try:
+                data = json.loads(self.rfile.read(n))
+            except ValueError:
+                raise ValueError("request body must be JSON")
+            if not isinstance(data, dict):
+                raise ValueError("request body must be a JSON object")
+            return data
+
+        def _guard(self, fn):
+            try:
+                self._send(200, fn())
+            except ValueError as e:
+                self._send(400, {"error": str(e)})
+            except KubeError as e:
+                self._send(e.status if e.status in (400, 403, 404, 409, 422) else 502,
+                           {"error": e.message})
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log("request failed:", repr(e))
+                self._send(500, {"error": str(e)})
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                try:
+                    with open(os.path.join(APP_DIR, "index.html"), "rb") as f:
+                        self._send(200, f.read(), "text/html; charset=utf-8")
+                except OSError:
+                    self._send(500, {"error": "index.html not found"})
+            elif path == "/healthz":
+                self._send(200, b"ok", "text/plain")
+            elif path == "/api/storageclasses":
+                self._guard(list_storage_classes)
+            elif path == "/api/workloads":
+                def lst():
+                    with lock:
+                        return sorted(workloads.values(), key=lambda w: (w["created"], w["name"]))
+                self._guard(lst)
+            elif path == "/api/stream":
+                self._stream()
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_POST(self):
+            if urlparse(self.path).path == "/api/workloads":
+                self._guard(lambda: create_workload(self._body()))
+            else:
+                self._send(404, {"error": "not found"})
+
+        def do_PATCH(self):
+            m = WORKLOAD_PATH.match(urlparse(self.path).path)
+            if not m:
+                return self._send(404, {"error": "not found"})
+
+            def scale():
+                n = _num(self._body(), "replicas", None, 0, MAX_REPLICAS, integer=True)
+                if n is None:
+                    raise ValueError("replicas is required")
+                return scale_workload(m.group(1), n)
+            self._guard(scale)
+
+        def do_DELETE(self):
+            m = WORKLOAD_PATH.match(urlparse(self.path).path)
+            if not m:
+                return self._send(404, {"error": "not found"})
+            self._guard(lambda: delete_workload(m.group(1)))
+
+        def _stream(self):
+            """Server-Sent Events: a snapshot with history, then one event per second."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            try:
+                with lock:
+                    snap = json.dumps({"history": list(history)})
+                    my_seq = seq
+                    current = last_event_json
+                self.wfile.write(f"event: snapshot\ndata: {snap}\n\n".encode())
+                self.wfile.write(f"data: {current}\n\n".encode())
+                self.wfile.flush()
+                while True:
+                    with cond:
+                        changed = cond.wait_for(lambda: seq != my_seq, timeout=15)
+                        my_seq = seq
+                        current = last_event_json
+                    if changed:
+                        self.wfile.write(f"data: {current}\n\n".encode())
+                    else:
+                        self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+
+    def main():
+        signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+        threading.Thread(target=refresh_loop, daemon=True).start()
+        threading.Thread(target=tick_loop, daemon=True).start()
+        ThreadingHTTPServer.daemon_threads = True
+        httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+        log(f"kube-iobench listening on :{PORT}, namespace={NAMESPACE}, worker image={IMAGE}")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+
+
+    if __name__ == "__main__":
+        main()
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>kube-iobench</title>
+    <style>
+      :root {
+        --font: "Segoe UI Variable Text", "Segoe UI", "SF Pro Text", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        --bg: #edf0f3;
+        --panel: #fafbfc;
+        --ink: #12202c;
+        --ink-inverse: #fafbfc;
+        --muted: #55656f;
+        --line: #d0d8df;
+        --grid: #e2e7ec;
+        --read: #0c7a86;
+        --write: #b02a7a;
+        --ok: #1a7f4b;
+        --warn: #96600a;
+        --bad: #b3261e;
+        --field: #ffffff;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #0d1318;
+          --panel: #141c23;
+          --ink: #e3e9ee;
+          --ink-inverse: #0d1318;
+          --muted: #8d9eac;
+          --line: #27333d;
+          --grid: #1e2932;
+          --read: #4cc2cf;
+          --write: #f27ab9;
+          --ok: #4cc88a;
+          --warn: #e0a64a;
+          --bad: #ff8077;
+          --field: #0f161c;
+        }
+      }
+      * { box-sizing: border-box; }
+      html { color-scheme: light dark; }
+      body {
+        margin: 0; background: var(--bg); color: var(--ink);
+        font: 14px/1.45 var(--font);
+        font-variant-numeric: tabular-nums;
+      }
+      h1, h2, h3, p { margin: 0; }
+      button, input, select { font: inherit; color: inherit; }
+      :focus-visible { outline: 2px solid var(--read); outline-offset: 2px; }
+
+      /* ---- top bar ---- */
+      .top {
+        display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+        padding: 12px 24px; border-bottom: 1px solid var(--line); background: var(--panel);
+      }
+      .top h1 { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+      .top .spacer { flex: 1; }
+      .top label { color: var(--muted); display: flex; align-items: center; gap: 8px; }
+      .conn { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); min-width: 110px; }
+      .conn::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--warn); }
+      .conn.live::before { background: var(--ok); }
+      .conn.down::before { background: var(--bad); }
+
+      /* ---- controls ---- */
+      button {
+        border: 1px solid var(--line); background: var(--panel); border-radius: 4px;
+        padding: 6px 14px; cursor: pointer;
+      }
+      button:hover { border-color: var(--muted); }
+      button:disabled { opacity: .55; cursor: default; }
+      button.primary { background: var(--ink); color: var(--ink-inverse); border-color: var(--ink); font-weight: 600; }
+      button.danger { color: var(--bad); }
+      button.danger:hover { border-color: var(--bad); }
+      input[type=text], input[type=number], select {
+        width: 100%; background: var(--field); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px;
+      }
+      select { width: auto; }
+      input:invalid { border-color: var(--bad); }
+
+      /* ---- layout ---- */
+      main { max-width: 1280px; margin: 0 auto; padding: 20px 24px 56px; display: grid; gap: 20px; }
+      .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+      .banner { padding: 10px 14px; border: 1px solid var(--bad); color: var(--bad); border-radius: 4px; background: var(--panel); }
+      .banner.info { border-color: var(--line); color: var(--ink); }
+
+      .hero { padding: 18px 20px 14px; }
+      .hero-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+      .hero-head h2 { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
+      .hero-head p { color: var(--muted); }
+
+      .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+      .chartbox { min-width: 0; }
+      .readout { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+      .readout .title { color: var(--muted); }
+      .vals { display: flex; gap: 20px; }
+      .val { display: flex; flex-direction: column; align-items: flex-start; }
+      .val .lab { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+      .val .lab::before { content: ""; width: 14px; height: 3px; border-radius: 2px; background: var(--c); }
+      .val.read { --c: var(--read); }
+      .val.write { --c: var(--write); }
+      .val b { font-weight: 600; font-size: 24px; line-height: 1.15; letter-spacing: -0.015em; white-space: nowrap; }
+      .val b small { font-size: 12px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-left: 4px; }
+      .row .val b { font-size: 19px; }
+      canvas { display: block; width: 100%; height: 190px; touch-action: pan-y; }
+      .row canvas { height: 140px; }
+
+      /* ---- workload rows ---- */
+      #list { display: grid; gap: 14px; }
+      .row { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 8px 24px; padding: 16px 20px; }
+      .meta { display: flex; flex-direction: column; gap: 12px; }
+      .meta h3 { font-size: 16px; font-weight: 650; overflow-wrap: anywhere; }
+      .status { display: flex; align-items: center; gap: 7px; color: var(--muted); }
+      .status::before { content: ""; flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--c, var(--muted)); }
+      .status.ok { --c: var(--ok); color: var(--ink); }
+      .status.warn { --c: var(--warn); }
+      .cfg { display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; margin: 0; }
+      .cfg dt { color: var(--muted); }
+      .cfg dd { margin: 0; overflow-wrap: anywhere; }
+      .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: auto; }
+      .scale { display: flex; align-items: center; gap: 8px; }
+      .scale label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+      .scale input { width: 72px; }
+      .row .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-self: start; }
+      .pods { grid-column: 1 / -1; margin-top: 6px; border-top: 1px solid var(--line); padding-top: 8px; }
+      .pods summary { cursor: pointer; color: var(--muted); width: max-content; }
+      .tablewrap { overflow-x: auto; margin-top: 8px; }
+      table { border-collapse: collapse; width: 100%; min-width: 680px; }
+      th, td { text-align: right; padding: 4px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+      th:nth-child(-n+3), td:nth-child(-n+3) { text-align: left; }
+      th { font-weight: 500; color: var(--muted); }
+
+      .empty { padding: 36px 24px; text-align: center; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); }
+      .empty p { margin-bottom: 14px; }
+
+      /* ---- dialog ---- */
+      dialog {
+        width: min(640px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--line); border-radius: 8px;
+        background: var(--panel); color: var(--ink);
+      }
+      dialog::backdrop { background: rgba(8, 14, 20, .55); }
+      dialog form { padding: 22px 24px; display: grid; gap: 16px; }
+      dialog h2 { font-size: 18px; font-weight: 650; }
+      .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 16px; }
+      .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+      .field.wide { grid-column: 1 / -1; }
+      .field > span { font-weight: 600; }
+      .field small { color: var(--muted); }
+      .check { flex-direction: row; gap: 8px; align-items: flex-start; }
+      .check input { margin-top: 3px; }
+      .check small { display: block; color: var(--muted); font-weight: 400; }
+      .formerr { color: var(--bad); min-height: 1.4em; }
+      .dlg-actions { display: flex; justify-content: flex-end; gap: 10px; }
+
+      @media (max-width: 980px) {
+        .row { grid-template-columns: 1fr; }
+        .actions { margin-top: 0; }
+      }
+      @media (max-width: 700px) {
+        .pair, .row .charts, .fields { grid-template-columns: 1fr; }
+        main { padding: 14px 12px 40px; }
+        .top { padding: 10px 12px; }
+      }
+    </style>
+    </head>
+    <body>
+    <header class="top">
+      <h1>kube-iobench</h1>
+      <span class="spacer"></span>
+      <label>Chart window
+        <select id="win">
+          <option value="60">1 minute</option>
+          <option value="300" selected>5 minutes</option>
+          <option value="900">15 minutes</option>
+        </select>
+      </label>
+      <span id="conn" class="conn" role="status">Connecting</span>
+      <button id="newBtn" class="primary" type="button">New workload</button>
+    </header>
+
+    <main>
+      <div id="banner" class="banner" hidden role="alert"></div>
+
+      <section class="panel hero" aria-labelledby="h-total">
+        <div class="hero-head">
+          <h2 id="h-total">All workloads</h2>
+          <p id="totalSub">Waiting for data</p>
+        </div>
+        <div class="pair" id="totalCharts"></div>
+      </section>
+
+      <section id="list" aria-label="Workloads"></section>
+
+      <div id="empty" class="empty" hidden>
+        <p>No workloads yet. Create one to start generating IO on a storage class.</p>
+        <button class="primary" type="button" id="emptyBtn">New workload</button>
+      </div>
+    </main>
+
+    <dialog id="dlg" aria-labelledby="dlgTitle">
+      <form id="form" novalidate>
+        <h2 id="dlgTitle">New workload</h2>
+        <div class="fields">
+          <label class="field">
+            <span>Name</span>
+            <input type="text" name="name" required maxlength="40" pattern="[a-z]([\-a-z0-9]*[a-z0-9])?" autocomplete="off" spellcheck="false">
+            <small>Lowercase letters, digits and dashes.</small>
+          </label>
+          <label class="field">
+            <span>Storage class</span>
+            <select name="storage_class" style="width:100%"><option value="">Cluster default</option></select>
+            <small id="scHint">Each replica gets its own volume from this class.</small>
+          </label>
+          <label class="field">
+            <span>Replicas</span>
+            <input type="number" name="replicas" value="1" min="1" max="200" step="1" required>
+            <small>Pods in the StatefulSet.</small>
+          </label>
+          <label class="field">
+            <span>Volume size (GiB)</span>
+            <input type="number" name="pvc_gib" min="0.001" step="any" placeholder="Automatic">
+            <small>Per pod. Empty sizes it to fit the file.</small>
+          </label>
+          <label class="field">
+            <span>File size (GiB)</span>
+            <input type="number" name="size_gib" value="1" min="0.001" step="any" required>
+            <small>Per pod. The volume is sized to fit.</small>
+          </label>
+          <label class="field">
+            <span>Block size</span>
+            <input type="text" name="block_size" value="4k" required autocomplete="off" spellcheck="false">
+            <small>For example 4k, 64k or 1m.</small>
+          </label>
+          <label class="field">
+            <span>Writes (%)</span>
+            <input type="number" name="write_pct" value="100" min="0" max="100" step="any" required>
+            <small>The rest are reads.</small>
+          </label>
+          <label class="field">
+            <span>IOPS limit</span>
+            <input type="number" name="iops" min="1" step="any" placeholder="No limit">
+            <small>Per pod, reads and writes combined.</small>
+          </label>
+          <label class="field">
+            <span>Throughput limit</span>
+            <input type="text" name="throughput" placeholder="No limit" autocomplete="off" spellcheck="false">
+            <small>Per pod, bytes per second, for example 50m.</small>
+          </label>
+          <label class="check wide field">
+            <input type="checkbox" name="sequential">
+            <span>Sequential access<small>Reads and writes each walk the file from the start. Otherwise offsets are random.</small></span>
+          </label>
+          <label class="check wide field">
+            <input type="checkbox" name="direct">
+            <span>Direct IO<small>Bypass the page cache so the numbers reflect the volume, not memory.</small></span>
+          </label>
+        </div>
+        <p id="formErr" class="formerr" role="alert"></p>
+        <div class="dlg-actions">
+          <button type="button" id="cancelBtn">Cancel</button>
+          <button type="submit" class="primary" id="createBtn">Create workload</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script>
+    'use strict';
+
+    const MiB = 1048576;
+    const MAX_POINTS = 900;
+    const nf = new Intl.NumberFormat();
+    const $ = (s, r = document) => r.querySelector(s);
+    const esc = s => String(s).replace(/[&<>"']/g,
+      c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    let hist = [];            // [{t, total:[ri,rb,wi,wb,n], w:{name:[...]}}]
+    let live = null;          // latest full event from the server
+    let windowSec = 300;
+    const rows = new Map();   // workload name -> row object
+    let totalCharts = [];
+    let totalRo = null;
+
+    /* ------------------------------------------------------------------ */
+    /* formatting                                                          */
+    /* ------------------------------------------------------------------ */
+    function fmtBps(bps) {
+      const m = bps / MiB;
+      if (m >= 1024) return [(m / 1024).toFixed(2), 'GiB/s'];
+      if (m >= 1) return [m.toFixed(m >= 100 ? 0 : m >= 10 ? 1 : 2), 'MiB/s'];
+      return [(bps / 1024).toFixed(0), 'KiB/s'];
+    }
+    const fmtIops = v => nf.format(Math.round(v));
+
+    function niceMax(v) {
+      if (!(v > 0)) return 1;
+      const e = Math.pow(10, Math.floor(Math.log10(v)));
+      const f = v / e;
+      return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e;
+    }
+    function axisNum(v) {
+      if (v === 0) return '0';
+      if (v >= 1e6) return +(v / 1e6).toFixed(1) + 'M';
+      if (v >= 1e3) return +(v / 1e3).toFixed(1) + 'k';
+      if (v >= 10) return String(Math.round(v));
+      return String(+v.toFixed(1));
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* drawing: only what is visible, only when something changed          */
+    /* ------------------------------------------------------------------ */
+    let palette = null;       // colours and font, read from CSS once (not on every draw)
+    function getPalette() {
+      if (palette) return palette;
+      const css = getComputedStyle(document.documentElement);
+      const v = n => css.getPropertyValue(n).trim();
+      palette = {
+        grid: v('--grid'), muted: v('--muted'), ink: v('--ink'), panel: v('--panel'), line: v('--line'),
+        read: v('--read'), write: v('--write'), font: getComputedStyle(document.body).fontFamily,
+      };
+      return palette;
+    }
+    const colorScheme = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    if (colorScheme && colorScheme.addEventListener) {
+      colorScheme.addEventListener('change', () => { palette = null; markDirty(); });
+    }
+
+    const charts = new Set();       // every chart that exists
+    let dirty = false;              // data changed: every chart needs a redraw
+    let drawQueued = false;
+    const nextFrame = cb => (window.requestAnimationFrame ? window.requestAnimationFrame(cb) : setTimeout(cb, 16));
+
+    function markDirty() { dirty = true; scheduleDraw(); }
+    function scheduleDraw() {
+      if (drawQueued) return;
+      drawQueued = true;
+      nextFrame(() => { drawQueued = false; drawPending(); });
+    }
+    function drawPending() {
+      if (document.hidden) return;                    // nothing to see; redone when the tab is shown
+      if (dirty) { dirty = false; for (const c of charts) c.stale = true; }
+      for (const c of charts) if (c.stale && c.visible) c.draw();
+    }
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) markDirty(); });
+
+    // charts scrolled out of view are not drawn; they catch up when they come back
+    const observer = window.IntersectionObserver
+      ? new IntersectionObserver(list => {
+          for (const e of list) {
+            const c = e.target._chart;
+            if (!c) continue;
+            c.visible = e.isIntersecting;
+            if (c.visible && c.stale) scheduleDraw();
+          }
+        }, { rootMargin: '200px' })
+      : null;
+
+    /* ------------------------------------------------------------------ */
+    /* canvas chart: plain read/write lines, or bands stacked by replica   */
+    /* ------------------------------------------------------------------ */
+    class Chart {
+      constructor(canvas, series, fmt) {
+        this.canvas = canvas;
+        // series(tStart) -> {times:[t], stacked, series:[{name, group, alpha, any, v}], tip?:(i)=>[lines]}
+        this.series = series;
+        this.fmt = fmt;          // value -> label for the plain-line tooltip
+        this.hoverX = null;
+        this.visible = true;
+        this.stale = true;
+        this.last = null;        // geometry and data of the last full draw, used by the tooltip
+        this.snap = null;        // copy of the last full draw: hovering only adds an overlay to it
+        this.snapValid = false;
+        this.overlayQueued = false;
+        canvas._chart = this;
+        charts.add(this);
+        if (observer) observer.observe(canvas);
+        canvas.addEventListener('pointermove', e => {
+          this.hoverX = e.clientX - canvas.getBoundingClientRect().left;
+          this.queueOverlay();
+        });
+        canvas.addEventListener('pointerleave', () => { this.hoverX = null; this.queueOverlay(); });
+      }
+
+      destroy() {
+        charts.delete(this);
+        if (observer) observer.unobserve(this.canvas);
+      }
+
+      queueOverlay() {
+        if (this.overlayQueued) return;
+        this.overlayQueued = true;
+        nextFrame(() => { this.overlayQueued = false; this.paintOverlay(); });
+      }
+
+      draw() {
+        const c = this.canvas;
+        const dpr = window.devicePixelRatio || 1;
+        const w = c.clientWidth, h = c.clientHeight;
+        if (!w || !h) return;
+        const W = Math.round(w * dpr), H = Math.round(h * dpr);
+        if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+        const g = c.getContext('2d');
+        if (!g) return;
+        g.setTransform(dpr, 0, 0, dpr, 0, 0);
+        g.clearRect(0, 0, w, h);
+
+        const pal = getPalette();
+        const tEnd = hist.length ? hist[hist.length - 1].t : Date.now() / 1000;
+        const tStart = tEnd - windowSec;
+        const d = this.series(tStart);
+        const n = d.times.length;
+        const nb = d.series.length;
+
+        const L = 42, R = 8, T = 8, B = 20;
+        const pw = w - L - R, ph = h - T - B;
+
+        // cumulative tops for stacked charts, plain maximum otherwise
+        let tops = null, max = 0;
+        if (d.stacked && n) {
+          tops = new Float64Array(nb * n);
+          const acc = new Float64Array(n);
+          for (let k = 0; k < nb; k++) {
+            const v = d.series[k].v, off = k * n;
+            for (let i = 0; i < n; i++) { acc[i] += v[i]; tops[off + i] = acc[i]; }
+          }
+          for (let i = 0; i < n; i++) if (acc[i] > max) max = acc[i];
+        } else {
+          for (const s of d.series) for (let i = 0; i < s.v.length; i++) if (s.v[i] > max) max = s.v[i];
+        }
+        const ymax = niceMax(max * 1.1);
+
+        g.font = '11px ' + pal.font;
+        g.lineWidth = 1;
+        g.textAlign = 'right';
+        g.textBaseline = 'middle';
+        for (let i = 0; i <= 4; i++) {
+          const y = Math.round(T + ph - ph * i / 4) + 0.5;
+          g.strokeStyle = pal.grid;
+          g.beginPath(); g.moveTo(L, y); g.lineTo(w - R, y); g.stroke();
+          g.fillStyle = pal.muted;
+          g.fillText(axisNum(ymax * i / 4), L - 6, y);
+        }
+        g.textBaseline = 'top';
+        g.textAlign = 'left';
+        g.fillStyle = pal.muted;
+        g.fillText(windowSec >= 120 ? (windowSec / 60) + ' min ago' : windowSec + ' s ago', L, h - B + 5);
+        g.textAlign = 'right';
+        g.fillText('now', w - R, h - B + 5);
+
+        const X = t => L + (t - tStart) / windowSec * pw;
+        const Y = v => T + ph - v / ymax * ph;
+
+        if (n && d.stacked) {
+          const xs = new Float64Array(n);
+          for (let i = 0; i < n; i++) xs[i] = X(d.times[i]);
+          // Bands are painted one by one, bottom to top, exactly as before.
+          for (let k = 0; k < nb; k++) {
+            const s = d.series[k];
+            if (!s.any) continue;
+            const color = pal[s.group];
+            const off = k * n, lo = (k - 1) * n;
+            g.beginPath();
+            for (let i = 0; i < n; i++) { const y = Y(tops[off + i]); i ? g.lineTo(xs[i], y) : g.moveTo(xs[i], y); }
+            for (let i = n - 1; i >= 0; i--) g.lineTo(xs[i], Y(k ? tops[lo + i] : 0));
+            g.closePath();
+            g.globalAlpha = s.alpha;
+            g.fillStyle = color;
+            g.fill();
+            g.globalAlpha = 1;
+            g.beginPath();
+            for (let i = 0; i < n; i++) { const y = Y(tops[off + i]); i ? g.lineTo(xs[i], y) : g.moveTo(xs[i], y); }
+            g.strokeStyle = color;
+            g.lineWidth = 1;
+            g.lineJoin = 'round';
+            g.stroke();
+          }
+        } else if (n) {
+          for (const s of d.series) {
+            const color = pal[s.group];
+            g.beginPath();
+            for (let i = 0; i < n; i++) { const x = X(d.times[i]), y = Y(s.v[i]); i ? g.lineTo(x, y) : g.moveTo(x, y); }
+            g.strokeStyle = color;
+            g.lineWidth = 1.75;
+            g.lineJoin = 'round';
+            g.stroke();
+            g.lineTo(X(d.times[n - 1]), T + ph);
+            g.lineTo(X(d.times[0]), T + ph);
+            g.closePath();
+            g.globalAlpha = 0.1;
+            g.fillStyle = color;
+            g.fill();
+            g.globalAlpha = 1;
+          }
+        }
+
+        this.last = { d, n, X, Y, tStart, L, T, pw, ph, w, dpr, pal };
+        this.stale = false;
+        this.snapValid = false;
+        if (this.hoverX != null) this.paintOverlay();     // keep the tooltip while the data scrolls
+      }
+
+      // crosshair + tooltip, painted on top of a saved copy of the plain chart
+      paintOverlay() {
+        const st = this.last;
+        if (!st) return;
+        const c = this.canvas;
+        const g = c.getContext('2d');
+        if (!g) return;
+        if (!this.snapValid) {
+          if (this.hoverX == null) return;               // plain chart is already on screen
+          if (!this.snap) this.snap = document.createElement('canvas');
+          if (this.snap.width !== c.width || this.snap.height !== c.height) { this.snap.width = c.width; this.snap.height = c.height; }
+          const sg = this.snap.getContext('2d');
+          sg.clearRect(0, 0, c.width, c.height);
+          sg.drawImage(c, 0, 0);
+          this.snapValid = true;
+        } else {
+          g.setTransform(1, 0, 0, 1, 0, 0);
+          g.clearRect(0, 0, c.width, c.height);
+          g.drawImage(this.snap, 0, 0);
+        }
+        g.setTransform(st.dpr, 0, 0, st.dpr, 0, 0);
+        if (this.hoverX == null) return;
+
+        const { d, n, X, Y, tStart, L, T, pw, ph, w, pal } = st;
+        if (!n) return;
+        const t = tStart + (this.hoverX - L) / pw * windowSec;
+        let bi = 0, bd = Infinity;
+        for (let i = 0; i < n; i++) {
+          const dd = Math.abs(d.times[i] - t);
+          if (dd < bd) { bd = dd; bi = i; }
+        }
+        const x = X(d.times[bi]);
+        g.strokeStyle = pal.muted;
+        g.lineWidth = 1;
+        g.beginPath(); g.moveTo(Math.round(x) + 0.5, T); g.lineTo(Math.round(x) + 0.5, T + ph); g.stroke();
+        const lines = [new Date(d.times[bi] * 1000).toLocaleTimeString()];
+        if (d.tip) {
+          lines.push(...d.tip(bi));
+        } else {
+          for (const s of d.series) {
+            g.beginPath(); g.arc(x, Y(s.v[bi]), 3.5, 0, 6.2832);
+            g.fillStyle = pal[s.group]; g.fill();
+            lines.push(s.name + '  ' + this.fmt(s.v[bi]));
+          }
+        }
+        g.font = '12px ' + pal.font;
+        const tw = Math.max(...lines.map(l => g.measureText(l).width)) + 16;
+        const th = lines.length * 16 + 8;
+        let bx = x > w / 2 ? x - tw - 10 : x + 10;
+        bx = Math.max(2, Math.min(bx, w - tw - 2));
+        g.fillStyle = pal.panel;
+        g.strokeStyle = pal.line;
+        g.beginPath(); g.rect(bx, T + 2, tw, th); g.fill(); g.stroke();
+        g.fillStyle = pal.ink;
+        g.textAlign = 'left';
+        g.textBaseline = 'top';
+        lines.forEach((l, i) => g.fillText(l, bx + 8, T + 6 + i * 16));
+      }
+    }
+
+    const KIND = {
+      bps:  { ri: 1, wi: 3, div: MiB, unit: 'MiB/s', num: v => v.toFixed(1) },
+      iops: { ri: 0, wi: 2, div: 1,   unit: 'IOPS',  num: v => fmtIops(v) },
+    };
+
+    // history is sorted by time: first entry that is not older than t
+    function firstIndexAtOrAfter(t) {
+      let lo = 0, hi = hist.length;
+      while (lo < hi) { const m = (lo + hi) >> 1; if (hist[m].t < t) lo = m + 1; else hi = m; }
+      return lo;
+    }
+
+    // plain read/write lines; sel === null -> cluster total, otherwise a workload name
+    function makeSeries(sel, kind) {
+      const { ri, wi, div } = KIND[kind];
+      return tStart => {
+        const times = [], r = [], w = [];
+        for (let i = firstIndexAtOrAfter(tStart); i < hist.length; i++) {
+          const k = hist[i];
+          const a = sel === null ? k.total : k.w[sel];
+          if (!a) continue;
+          times.push(k.t);
+          r.push(a[ri] / div);
+          w.push(a[wi] / div);
+        }
+        return { times, stacked: false,
+                 series: [{ name: 'Read', group: 'read', v: r }, { name: 'Write', group: 'write', v: w }] };
+      };
+    }
+
+    const podOrdinal = s => { const m = /(\d+)$/.exec(s); return m ? parseInt(m[1], 10) : 0; };
+
+    // pod names seen per workload, with the time of the newest entry they appear in
+    const podSeen = new Map();
+    function noteEntry(e) {
+      if (!e.p) return;
+      for (const name in e.p) {
+        let m = podSeen.get(name);
+        if (!m) podSeen.set(name, m = new Map());
+        for (const pn in e.p[name]) m.set(pn, e.t);
+      }
+    }
+    function rebuildPodSeen() {
+      podSeen.clear();
+      for (const e of hist) noteEntry(e);
+    }
+
+    // one band per replica: all reads at the bottom, all writes stacked on top
+    function makeStackedSeries(name, kind) {
+      const { ri, wi, div, unit, num } = KIND[kind];
+      return tStart => {
+        const ticks = [];
+        for (let i = firstIndexAtOrAfter(tStart); i < hist.length; i++) if (hist[i].w[name]) ticks.push(hist[i]);
+        const pods = [];
+        const seen = podSeen.get(name);
+        if (seen) for (const [pn, last] of seen) if (last >= tStart) pods.push(pn);
+        pods.sort((a, b) => podOrdinal(a) - podOrdinal(b));
+
+        const n = ticks.length, P = pods.length;
+        const reads = new Array(P), writes = new Array(P);
+        const anyR = new Uint8Array(P), anyW = new Uint8Array(P);
+        for (let j = 0; j < P; j++) { reads[j] = new Float64Array(n); writes[j] = new Float64Array(n); }
+        const times = new Array(n);
+        for (let i = 0; i < n; i++) {
+          times[i] = ticks[i].t;
+          const pm = ticks[i].p && ticks[i].p[name];
+          if (!pm) continue;
+          for (let j = 0; j < P; j++) {
+            const a = pm[pods[j]];
+            if (!a) continue;
+            const r = a[ri] / div, w = a[wi] / div;
+            reads[j][i] = r; writes[j][i] = w;
+            if (r > 0) anyR[j] = 1;
+            if (w > 0) anyW[j] = 1;
+          }
+        }
+        const series = [];
+        for (let j = 0; j < P; j++) series.push({ name: 'Read ' + pods[j], group: 'read', alpha: j % 2 ? 0.28 : 0.55, any: anyR[j] === 1, v: reads[j] });
+        for (let j = 0; j < P; j++) series.push({ name: 'Write ' + pods[j], group: 'write', alpha: j % 2 ? 0.28 : 0.55, any: anyW[j] === 1, v: writes[j] });
+        return {
+          times, stacked: true, series,
+          tip: i => {
+            let R = 0, W = 0;
+            for (let j = 0; j < P; j++) { R += reads[j][i]; W += writes[j][i]; }
+            const out = ['Read  ' + num(R) + ' ' + unit, 'Write  ' + num(W) + ' ' + unit];
+            if (P <= 8) {
+              out.push('Per replica, read / write:');
+              pods.forEach((pn, j) => out.push('#' + podOrdinal(pn) + '  ' + num(reads[j][i]) + ' / ' + num(writes[j][i])));
+            } else {
+              out.push(nf.format(P) + ' replicas');
+            }
+            return out;
+          },
+        };
+      };
+    }
+
+    const fmtTip = {
+      bps: v => v.toFixed(2) + ' MiB/s',
+      iops: v => fmtIops(v) + ' IOPS',
+    };
+
+    // history helpers: a deleted workload must leave no trace, totals follow
+    const sumAll = w => {
+      const t = [0, 0, 0, 0, 0];
+      for (const a of Object.values(w)) for (let i = 0; i < 5; i++) t[i] += a[i];
+      return t;
+    };
+    function purgeWorkload(name) {
+      for (const k of hist) {
+        if (!k.w[name]) continue;
+        delete k.w[name];
+        if (k.p) delete k.p[name];
+        k.total = sumAll(k.w);
+      }
+      podSeen.delete(name);
+      markDirty();
+    }
+
+    // DOM writes only when the value really changed (a write invalidates layout even if it is the same)
+    function setText(el, v) { if (el._t !== v) { el._t = v; el.textContent = v; } }
+    function setHTML(el, v) { if (el._h !== v) { el._h = v; el.innerHTML = v; } }
+    function setClass(el, v) { if (el._c !== v) { el._c = v; el.className = v; } }
+
+    function chartBoxHTML(title, kind) {
+      return `<figure class="chartbox" style="margin:0" data-kind="${kind}">
+        <div class="readout">
+          <span class="title">${title}</span>
+          <span class="vals">
+            <span class="val read"><span class="lab">Read</span><b data-v="r">0</b></span>
+            <span class="val write"><span class="lab">Write</span><b data-v="w">0</b></span>
+          </span>
+        </div>
+        <canvas aria-label="${title} over time"></canvas>
+      </figure>`;
+    }
+
+    function readoutEls(scope) {
+      const pick = kind => {
+        const box = $(`[data-kind="${kind}"]`, scope);
+        return { r: $('[data-v="r"]', box), w: $('[data-v="w"]', box) };
+      };
+      return { bps: pick('bps'), iops: pick('iops') };
+    }
+
+    function setReadout(ro, kind, a) {
+      const e = ro[kind];
+      if (kind === 'bps') {
+        const [rn, ru] = fmtBps(a[1]);
+        const [wn, wu] = fmtBps(a[3]);
+        setHTML(e.r, `${rn}<small>${ru}</small>`);
+        setHTML(e.w, `${wn}<small>${wu}</small>`);
+      } else {
+        setHTML(e.r, `${fmtIops(a[0])}<small>IOPS</small>`);
+        setHTML(e.w, `${fmtIops(a[2])}<small>IOPS</small>`);
+      }
+    }
+
+    function makeCharts(scope, sel, isStacked) {
+      const out = [];
+      for (const kind of ['bps', 'iops']) {
+        const canvas = $(`[data-kind="${kind}"] canvas`, scope);
+        const plain = makeSeries(sel, kind);
+        const stacked = sel === null ? null : makeStackedSeries(sel, kind);
+        const pick = ts => (stacked && isStacked && isStacked()) ? stacked(ts) : plain(ts);
+        out.push(new Chart(canvas, pick, fmtTip[kind]));
+      }
+      return out;
+    }
+
+    function setTitles(row) {
+      $('[data-kind="bps"] .title', row.el).textContent = row.stacked ? 'Throughput, MiB/s by replica' : 'Throughput, MiB/s';
+      $('[data-kind="iops"] .title', row.el).textContent = row.stacked ? 'IOPS by replica' : 'IOPS';
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* rendering                                                           */
+    /* ------------------------------------------------------------------ */
+    const plural = (n, one, many) => `${nf.format(n)} ${n === 1 ? one : many}`;
+
+    function initTotal() {
+      const box = $('#totalCharts');
+      box.innerHTML = chartBoxHTML('Throughput, MiB/s', 'bps') + chartBoxHTML('IOPS', 'iops');
+      totalCharts = makeCharts(box, null);
+      totalRo = readoutEls(box);
+    }
+
+    function renderTotal() {
+      const t = live.total;
+      setReadout(totalRo, 'bps', t);
+      setReadout(totalRo, 'iops', t);
+      const n = live.workloads.length;
+      setText($('#totalSub'), n
+        ? `${plural(n, 'workload', 'workloads')}, ${plural(t[4], 'pod', 'pods')} generating IO`
+        : 'No workloads running');
+    }
+
+    function cfgHTML(c) {
+      if (!c || !c.name) return placementRow;
+      const lim = [];
+      if (c.iops) lim.push(nf.format(c.iops) + ' IOPS');
+      if (c.throughput) lim.push(c.throughput + ' per second');
+      const items = [
+        ['Storage class', c.storage_class || 'cluster default'],
+        ...(c.pvc_gib ? [['Volume size', c.pvc_gib + ' GiB per pod']] : []),
+        ['File size', c.size_gib + ' GiB per pod'],
+        ['Block size', c.block_size],
+        ['Access', (c.sequential ? 'sequential' : 'random') + (c.direct ? ', direct IO' : '')],
+        ['Writes', c.write_pct + '%'],
+        ['Limits', lim.length ? lim.join(', ') + ' per pod' : 'none'],
+      ];
+      return items.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('') + placementRow;
+    }
+    const placementRow = '<dt>Placement</dt><dd data-nodes></dd>';
+
+    function createRow(w) {
+      const el = document.createElement('article');
+      el.className = 'panel row';
+      el.innerHTML = `
+        <div class="meta">
+          <div>
+            <h3>${esc(w.name)}</h3>
+            <p class="status" data-status></p>
+          </div>
+          <dl class="cfg" data-cfg></dl>
+          <div class="actions">
+            <form class="scale" data-scale>
+              <label>Replicas <input type="number" min="0" max="200" step="1" data-rep required></label>
+              <button type="submit">Apply</button>
+            </form>
+            <button type="button" class="danger" data-del>Delete</button>
+          </div>
+        </div>
+        <div class="charts">${chartBoxHTML('Throughput, MiB/s', 'bps')}${chartBoxHTML('IOPS', 'iops')}</div>
+        <details class="pods" data-pods>
+          <summary>Pods</summary>
+          <div class="tablewrap"><table>
+            <thead><tr><th>Pod</th><th>Node</th><th>State</th><th>Read</th><th>Read IOPS</th><th>Write</th><th>Write IOPS</th></tr></thead>
+            <tbody></tbody>
+          </table></div>
+        </details>`;
+      const row = { el, name: w.name, uid: w.uid, stacked: w.replicas > 1, cfgKey: null, dirty: false, podsData: [] };
+      row.charts = makeCharts(el, w.name, () => row.stacked);
+      row.ro = readoutEls(el);
+      row.statusEl = $('[data-status]', el);
+      row.cfgEl = $('[data-cfg]', el);
+      row.nodesEl = null;
+      setTitles(row);
+      row.rep = $('[data-rep]', el);
+      row.details = $('[data-pods]', el);
+      row.rep.addEventListener('input', () => { row.dirty = true; });
+      row.details.addEventListener('toggle', () => { if (row.details.open) fillPods(row); });
+
+      $('[data-scale]', el).addEventListener('submit', async e => {
+        e.preventDefault();
+        const n = parseInt(row.rep.value, 10);
+        if (isNaN(n)) return;
+        try {
+          await api('PATCH', 'api/workloads/' + encodeURIComponent(w.name), { replicas: n });
+          row.dirty = false;
+          notify(`Scaled ${w.name} to ${plural(n, 'replica', 'replicas')}.`);
+        } catch (err) { notify(err.message, true); }
+      });
+      $('[data-del]', el).addEventListener('click', async () => {
+        if (!confirm(`Delete workload "${w.name}" and its volumes?`)) return;
+        try {
+          await api('DELETE', 'api/workloads/' + encodeURIComponent(w.name));
+          notify(`Deleted ${w.name}.`);
+        } catch (err) { notify(err.message, true); }
+      });
+      return row;
+    }
+
+    function fillPods(row) {
+      const body = $('tbody', row.details);
+      body.innerHTML = row.podsData.map(p => {
+        const [rb, ru] = fmtBps(p.v[1]);
+        const [wb, wu] = fmtBps(p.v[3]);
+        return `<tr><td>${esc(p.name)}</td><td>${esc(p.node || 'not scheduled')}</td><td>${esc(p.state)}</td>
+          <td>${rb} ${ru}</td><td>${fmtIops(p.v[0])}</td><td>${wb} ${wu}</td><td>${fmtIops(p.v[2])}</td></tr>`;
+      }).join('');
+    }
+
+    function updateRow(row, w, pods, agg) {
+      const counts = {};
+      for (const p of pods) counts[p.state] = (counts[p.state] || 0) + 1;
+      const running = counts.running || 0;
+      let text, cls = '';
+      if (w.replicas === 0) {
+        text = 'Stopped, 0 replicas';
+      } else {
+        const parts = [`${running} of ${w.replicas} generating IO`];
+        for (const k of Object.keys(counts)) if (k !== 'running') parts.push(`${counts[k]} ${k}`);
+        text = parts.join(', ');
+        cls = running === w.replicas ? 'ok' : 'warn';
+      }
+      setText(row.statusEl, text);
+      setClass(row.statusEl, 'status ' + cls);
+
+      const stacked = w.replicas > 1;
+      if (stacked !== row.stacked) { row.stacked = stacked; setTitles(row); markDirty(); }
+
+      const key = JSON.stringify(w.config);
+      if (key !== row.cfgKey) {
+        row.cfgEl.innerHTML = cfgHTML(w.config);
+        row.cfgKey = key;
+        row.nodesEl = $('[data-nodes]', row.el);
+        if (row.nodesEl) row.nodesEl._t = undefined;
+      }
+
+      const nodes = new Set(pods.map(p => p.node).filter(Boolean));
+      const placed = pods.filter(p => p.node).length;
+      if (row.nodesEl) {
+        setText(row.nodesEl, !placed ? 'not scheduled yet'
+          : (w.replicas > 1 && placed > 1 && nodes.size === 1) ? `all ${placed} pods on one node`
+          : plural(nodes.size, 'node', 'nodes'));
+      }
+
+      if (!row.dirty && document.activeElement !== row.rep) row.rep.value = w.replicas;
+      setReadout(row.ro, 'bps', agg);
+      setReadout(row.ro, 'iops', agg);
+      row.podsData = pods;
+      if (row.details.open) fillPods(row);
+    }
+
+    function syncRows() {
+      const list = live.workloads;
+      const host = $('#list');
+      list.forEach((w, i) => {
+        let row = rows.get(w.name);
+        if (!row) { row = createRow(w); rows.set(w.name, row); }
+        const at = host.children[i];
+        if (at !== row.el) host.insertBefore(row.el, at || null);
+        updateRow(row, w, live.pods[w.name] || [], live.w[w.name] || [0, 0, 0, 0, 0]);
+      });
+      $('#empty').hidden = list.length > 0;
+    }
+
+    // A workload that was deleted, or deleted and created again under the same name, loses all
+    // its history. This runs before new data is added, so nothing of the new one is lost.
+    function dropGone(list) {
+      const byName = new Map(list.map(w => [w.name, w]));
+      for (const [name, row] of rows) {
+        const w = byName.get(name);
+        if (!w || w.uid !== row.uid) {
+          row.charts.forEach(c => c.destroy());
+          row.el.remove();
+          rows.delete(name);
+          purgeWorkload(name);
+        }
+      }
+    }
+
+    function render() {
+      if (!live) return;
+      const banner = $('#banner');
+      if (live.error) { banner.textContent = live.error; banner.className = 'banner'; banner.hidden = false; }
+      else if (banner.dataset.sticky !== '1') banner.hidden = true;
+      renderTotal();
+      syncRows();
+    }
+
+    let noticeTimer = null;
+    function notify(text, isError) {
+      const b = $('#banner');
+      b.textContent = text;
+      b.className = 'banner' + (isError ? '' : ' info');
+      b.hidden = false;
+      b.dataset.sticky = '1';
+      clearTimeout(noticeTimer);
+      noticeTimer = setTimeout(() => { b.dataset.sticky = '0'; if (!live || !live.error) b.hidden = true; }, 6000);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* server communication                                                */
+    /* ------------------------------------------------------------------ */
+    async function api(method, url, body) {
+      const res = await fetch(url, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : {},
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      let data = {};
+      try { data = await res.json(); } catch (e) { /* empty body */ }
+      if (!res.ok) throw new Error(data.error || res.statusText || 'Request failed');
+      return data;
+    }
+
+    // Every entry is one whole second [t-1, t) that the server has finished.
+    function addEntry(e) {
+      const last = hist.length ? hist[hist.length - 1] : null;
+      if (last && e.t < last.t) return;                       // older than what we already have
+      if (last && e.t === last.t) hist[hist.length - 1] = e;  // same second again: replace
+      else hist.push(e);
+      if (hist.length > MAX_POINTS) hist.splice(0, hist.length - MAX_POINTS);
+      noteEntry(e);
+      markDirty();
+    }
+
+    function connect() {
+      const conn = $('#conn');
+      const es = new EventSource('api/stream');
+      es.onopen = () => { conn.textContent = 'Live'; conn.className = 'conn live'; };
+      es.onerror = () => { conn.textContent = 'Reconnecting'; conn.className = 'conn down'; };
+      es.addEventListener('snapshot', e => { hist = JSON.parse(e.data).history || []; rebuildPodSeen(); markDirty(); });
+      es.onmessage = e => {
+        const ev = JSON.parse(e.data);
+        if (!ev.t) return;
+        dropGone(ev.workloads);
+        live = ev;
+        for (const entry of ev.entries || []) addEntry(entry);
+        render();
+      };
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* new workload dialog                                                 */
+    /* ------------------------------------------------------------------ */
+    const dlg = $('#dlg'), form = $('#form');
+
+    function suggestName() {
+      let i = 1;
+      while (rows.has('bench-' + i)) i++;
+      return 'bench-' + i;
+    }
+
+    async function loadClasses() {
+      const sel = form.elements.storage_class;
+      const hint = $('#scHint');
+      try {
+        const list = await api('GET', 'api/storageclasses');
+        const keep = sel.value;
+        sel.innerHTML = '<option value="">Cluster default</option>' + list.map(c =>
+          `<option value="${esc(c.name)}">${esc(c.name)}${c.default ? ' (default)' : ''}</option>`).join('');
+        sel.value = keep;
+        const hasDefault = list.some(c => c.default);
+        if (!list.length) hint.textContent = 'No storage classes found in this cluster.';
+        else if (!hasDefault) {
+          hint.textContent = 'This cluster has no default class, so pick one.';
+          if (!keep) sel.value = list[0].name;
+        } else hint.textContent = 'Each replica gets its own volume from this class.';
+      } catch (err) {
+        hint.textContent = 'Could not list storage classes: ' + err.message;
+      }
+    }
+
+    // shows what "automatic" would pick for the current file size (same rule as the backend)
+    function updateAutoVolume() {
+      const size = parseFloat(form.elements.size_gib.value);
+      form.elements.pvc_gib.placeholder = size > 0
+        ? 'Automatic, ' + Math.max(Math.ceil(size * 1.1), Math.ceil(size) + 1) + ' GiB'
+        : 'Automatic';
+    }
+    form.elements.size_gib.addEventListener('input', updateAutoVolume);
+
+    function openDialog() {
+      updateAutoVolume();
+      form.elements.name.value = suggestName();
+      $('#formErr').textContent = '';
+      loadClasses();
+      dlg.showModal();
+      form.elements.name.select();
+    }
+
+    $('#newBtn').addEventListener('click', openDialog);
+    $('#emptyBtn').addEventListener('click', openDialog);
+    $('#cancelBtn').addEventListener('click', () => dlg.close());
+
+    form.addEventListener('submit', async e => {
+      e.preventDefault();
+      const err = $('#formErr');
+      err.textContent = '';
+      if (!form.checkValidity()) {
+        form.reportValidity();
+        return;
+      }
+      const f = form.elements;
+      const body = {
+        name: f.name.value.trim(),
+        storage_class: f.storage_class.value,
+        replicas: parseInt(f.replicas.value, 10),
+        size_gib: parseFloat(f.size_gib.value),
+        block_size: f.block_size.value.trim(),
+        write_pct: parseFloat(f.write_pct.value),
+        pvc_gib: f.pvc_gib.value === '' ? null : parseFloat(f.pvc_gib.value),
+        iops: f.iops.value === '' ? null : parseFloat(f.iops.value),
+        throughput: f.throughput.value.trim() || null,
+        sequential: f.sequential.checked,
+        direct: f.direct.checked,
+      };
+      const btn = $('#createBtn');
+      btn.disabled = true;
+      try {
+        await api('POST', 'api/workloads', body);
+        dlg.close();
+        notify(`Created ${body.name}. Pods start shortly.`);
+      } catch (ex) {
+        err.textContent = ex.message;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    /* ------------------------------------------------------------------ */
+    $('#win').addEventListener('change', e => { windowSec = parseInt(e.target.value, 10); markDirty(); });
+    window.addEventListener('resize', markDirty);
+    initTotal();
+    connect();
+    </script>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iobench-ui
+  namespace: kube-iobench
+  labels:
+    app.kubernetes.io/name: iobench-ui
+    app.kubernetes.io/part-of: kube-iobench
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate        # one instance: metric history is held in memory
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: iobench-ui
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: iobench-ui
+        app.kubernetes.io/part-of: kube-iobench
+      annotations:
+        kube-iobench/app-sha256: "6666d07058eca4e8"   # restarts the pod when the app code changes
+    spec:
+      serviceAccountName: iobench-ui
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ui
+          image: python:3.12-slim
+          command: ["python3", "-u", "/app/server.py"]
+          env:
+            - name: IOBENCH_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: IOBENCH_IMAGE              # image used by the worker pods
+              value: "python:3.12-slim"
+            - name: IOBENCH_SCRIPT_CONFIGMAP
+              value: iobench-script
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: app
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: app
+          configMap:
+            name: iobench-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: iobench-ui
+  namespace: kube-iobench
+  labels:
+    app.kubernetes.io/part-of: kube-iobench
+spec:
+  selector:
+    app.kubernetes.io/name: iobench-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+  type: NodePort
